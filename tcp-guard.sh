@@ -129,20 +129,39 @@ get_listen_ports() {
     }' | sort -un | tr '\n' ' '
 }
 
-# 保护名单 = 当前活跃 SSH 会话来源 + 白名单文件
-# SSH 会话是动态的，断线期间该 IP 会失去保护，故额外支持白名单文件长期固化
+# 保护名单 = 已通过认证的 SSH 会话来源 + 白名单文件
+#
+# 不能简单用 `ss | grep sshd` 收集来源: 暴力破解者连上 22 端口后，在认证失败前
+# sshd 同样持有一条 ESTABLISHED 连接，会被一并收进保护名单。攻击者只要挂住一条
+# 不完成认证的连接就能让自己免疫封禁。因此这里只认已完成认证的会话。
 get_protected() {
     {
-        [[ -n "${SSH_CLIENT:-}" ]] && awk '{print $1}' <<<"$SSH_CLIENT"
+        [[ -n "${SSH_CLIENT:-}" ]]     && awk '{print $1}' <<<"$SSH_CLIENT"
         [[ -n "${SSH_CONNECTION:-}" ]] && awk '{print $1}' <<<"$SSH_CONNECTION"
-        # 带 state 过滤时 ss 省略 State 列: Recv-Q Send-Q Local Peer
-        ss -tanpH state established 2>/dev/null | grep -F 'sshd' | awk '{
-            s=$4; i=length(s)
-            while (i>0 && substr(s,i,1)!=":") i--
-            ip=substr(s,1,i-1)
-            gsub(/^\[|\]$/,"",ip); sub(/^::ffff:/,"",ip)
-            print ip
+
+        # utmp 仅记录认证成功的登录；来源 IP 是行尾括号内的部分
+        who 2>/dev/null | awk '{
+            if (match($0, /\([^)]+\)$/)) {
+                ip = substr($0, RSTART+1, RLENGTH-2)
+                if (ip ~ /\./ || ip ~ /:.*:/) print ip
+            }
         }'
+
+        # 补上无 tty 的已认证会话（IDE 远程连接等，不写入 utmp）。
+        # 已认证子进程命令行为 "sshd: user@pts/N" 或 "sshd: user@notty"，
+        # preauth 连接则是 "sshd: unknown [priv]" / "sshd: [accepted]"，不会命中。
+        local pids
+        pids=$(ps -eo pid=,args= 2>/dev/null |
+               awk '/sshd: [a-zA-Z0-9_.-]+@(pts|notty)/ {print $1}' | paste -sd'|')
+        [[ -n "$pids" ]] && ss -tanpH state established 2>/dev/null |
+            grep -E "pid=($pids)," | awk '{
+                s=$4; i=length(s)
+                while (i>0 && substr(s,i,1)!=":") i--
+                ip=substr(s,1,i-1)
+                gsub(/^\[|\]$/,"",ip); sub(/^::ffff:/,"",ip)
+                print ip
+            }'
+
         [[ -r "$WHITELIST" ]] && grep -vE '^\s*(#|$)' "$WHITELIST" | awk '{print $1}'
     } 2>/dev/null | grep -vE '^(127\.|::1$|$)' | sort -u | tr '\n' ' '
 }
